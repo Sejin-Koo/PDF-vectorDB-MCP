@@ -450,4 +450,62 @@ const handler = createMcpHandler(
   { basePath: "/api", maxDuration: 60, verboseLogs: true }
 );
 
-export { handler as GET, handler as POST, handler as DELETE };
+// ─── 접근 게이트 ─────────────────────────────────────────────────────────────
+// 이 서버는 포니링크 사규(ponylink_rules)를 포함한 지식베이스를 다루므로, 엔드포인트
+// 주소만 알면 누구나 호출할 수 있는 상태를 막는다. 호출자는 URL 쿼리스트링으로
+// 발급받은 게이트키를 전달한다:  https://<도메인>/api/mcp?k=<발급키>
+//
+//   MCP_GATE_KEYS : 허용 키 목록(쉼표 구분). **비어 있으면 게이트가 아예 비활성**이라
+//                   모든 요청이 통과한다(코드만 배포하고 키를 안 넣은 상태 = 종전과 동일).
+//   MCP_GATE_MODE : "enforce" 이면 키가 없거나 목록에 없을 때 401로 차단.
+//                   그 밖의 값(기본 "observe")이면 통과시키되 로그만 남긴다.
+//                   → 커넥터 URL을 새 주소로 교체하는 기간에 서비스가 끊기지 않도록
+//                     먼저 observe로 배포해 로그를 확인한 뒤 enforce로 올리는 용도.
+//
+// 로그에는 키 전문을 남기지 않고 발급 대상 식별자(plk_<대상>_... 의 <대상>)만 남긴다.
+// 이 로그가 곧 사용량·이상징후 확인 수단이 된다(Vercel 함수 로그에서 조회).
+const GATE_KEYS = (process.env.MCP_GATE_KEYS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const GATE_MODE = (process.env.MCP_GATE_MODE || "observe").trim().toLowerCase();
+
+function keyLabel(k) {
+  if (!k) return "(none)";
+  const m = String(k).match(/^plk_([A-Za-z0-9]+)_/);
+  return m ? m[1] : `${String(k).slice(0, 8)}…`;
+}
+
+function withGate(h) {
+  return async (req, ctx) => {
+    let k = null;
+    try {
+      k = new URL(req.url).searchParams.get("k");
+    } catch (e) {
+      k = null;
+    }
+    const allowed = GATE_KEYS.length === 0 || (!!k && GATE_KEYS.includes(k));
+    console.log(
+      `[gate] mode=${GATE_MODE} method=${req.method} caller=${keyLabel(k)} allowed=${allowed}`
+    );
+    if (!allowed && GATE_MODE === "enforce") {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32001,
+            message:
+              "접근 권한이 없습니다. 이 서버는 발급받은 게이트키가 포함된 주소(…/api/mcp?k=<발급키>)로만 호출할 수 있습니다.",
+          },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    return h(req, ctx);
+  };
+}
+
+export const GET = withGate(handler);
+export const POST = withGate(handler);
+export const DELETE = withGate(handler);
