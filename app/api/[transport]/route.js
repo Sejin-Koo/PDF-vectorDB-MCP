@@ -10,6 +10,11 @@ const OUTPUT_DIMENSION = 1024;
 const RERANK_MODEL = "rerank-2.5";
 const RETRIEVE_MULTIPLIER = 4;
 
+// search_book_library 발췌 기본 길이. max_chars=0으로 호출하면 자르지 않는다.
+const DEFAULT_SNIPPET_CHARS = 700;
+// get_chunk_text가 한 번에 돌려줄 수 있는 본문 총량 상한(응답 폭주 방지).
+const MAX_TOTAL_CHARS = 60000;
+
 /** Voyage AI로 쿼리 텍스트를 임베딩 벡터로 변환 */
 async function embedQuery(text) {
   const res = await fetch("https://api.voyageai.com/v1/embeddings", {
@@ -136,6 +141,16 @@ function articleVariants(no) {
   return [...v];
 }
 
+/** payload에서 문서명을 꺼낸다 (사규는 doc_title, 책은 book_title) */
+function payloadDocTitle(payload) {
+  return String(payload?.doc_title || payload?.book_title || "");
+}
+
+/** 공백을 무시한 부분일치 */
+function looseIncludes(haystack, needle) {
+  return String(haystack).replace(/\s/g, "").includes(String(needle).replace(/\s/g, ""));
+}
+
 /** 전체 컬렉션 목록 + 각 컬렉션의 포인트 개수 조회 */
 async function listCollections() {
   const listRes = await fetch(`${QDRANT_URL}/collections`, {
@@ -197,7 +212,9 @@ const handler = createMcpHandler(
           "포니링크 IT사업본부의 벡터 지식베이스(M&A 실무서, 영문계약 실무서, 가치평가 서적 등)에서 " +
           "의미 기반 검색을 수행합니다. 자연어 질문을 그대로 입력하면 관련도 높은 순으로 " +
           "책 제목, 페이지 범위, 발췌문을 반환합니다. 어떤 컬렉션이 있는지 모르면 " +
-          "list_book_collections를 먼저 호출하세요.",
+          "list_book_collections를 먼저 호출하세요. " +
+          "발췌문은 기본 700자에서 잘리며, 표·목록·질의회신이 중간에서 잘려 보이면 " +
+          "max_chars=0으로 다시 호출해 청크 전문을 받으세요(같은 검색어로 재시도하는 것은 해결책이 아닙니다).",
         inputSchema: {
           collection: z
             .string()
@@ -212,10 +229,23 @@ const handler = createMcpHandler(
             .max(20)
             .default(5)
             .describe("반환할 결과 개수 (기본 5)"),
+          max_chars: z
+            .number()
+            .int()
+            .min(0)
+            .max(20000)
+            .default(DEFAULT_SNIPPET_CHARS)
+            .describe(
+              "각 결과 발췌문의 최대 글자 수 (기본 700). 0을 넣으면 자르지 않고 청크 전문을 " +
+                "줄바꿈까지 보존해 반환합니다. 결과가 '...'로 끝나면 0으로 재호출하세요"
+            ),
         },
       },
-      async ({ collection, query, top_k }) => {
+      async ({ collection, query, top_k, max_chars }) => {
         const topK = top_k ?? 5;
+        const LIMIT =
+          max_chars === undefined || max_chars === null ? DEFAULT_SNIPPET_CHARS : max_chars;
+        const noLimit = LIMIT === 0;
         const queryVector = await embedQuery(query);
         const retrieved = await qdrantQuery(collection, queryVector, topK * RETRIEVE_MULTIPLIER);
 
@@ -233,27 +263,41 @@ const handler = createMcpHandler(
         const documents = retrieved.map((r) => r.payload?.text || "");
         const reranked = await rerankDocuments(query, documents, topK);
 
+        let budget = MAX_TOTAL_CHARS;
         const resultBlocks = reranked.map((r, rank) => {
           const original = retrieved[r.index];
           const payload = original.payload || {};
           const full = payload.text || "";
-          const LIMIT = 700;
-          const snippet = full.slice(0, LIMIT).replace(/\n/g, " ");
-          const truncated = full.length > LIMIT;
+          // 전문 모드에서는 줄바꿈을 유지해야 표·목록이 읽힌다.
+          let body;
+          let tail = "";
+          if (noLimit) {
+            const room = Math.max(0, budget);
+            body = full.slice(0, room);
+            budget -= body.length;
+            if (full.length > body.length) {
+              tail = `\n(응답 총량 상한 ${MAX_TOTAL_CHARS}자에 걸려 이 청크는 ${body.length}/${full.length}자만 표시됨 — top_k를 줄이거나 get_chunk_text로 개별 조회하세요)`;
+            }
+          } else {
+            body = full.slice(0, LIMIT).replace(/\n/g, " ");
+            if (full.length > LIMIT) {
+              const locator = payload.article_no
+                ? `get_rule_article(collection="${collection}", article_no="${payload.article_no}")`
+                : `max_chars=0으로 재호출하거나 get_chunk_text(collection="${collection}", doc_title="${payloadDocTitle(payload)}", page_start=${payload.page_start})`;
+              tail = `...\n(발췌 ${LIMIT}자 / 전체 ${full.length}자 — 전문: ${locator})`;
+            }
+          }
           // 사규(조문 단위 저장) 컬렉션이면 출처에 조문 번호·표제를 함께 표시
           const art = payload.article_no
             ? ` ${payload.article_no}${payload.article_title ? `(${payload.article_title})` : ""}`
             : "";
           const source = payload.article_no
-            ? `출처: ${payload.doc_title || payload.book_title}${art}`
+            ? `출처: ${payloadDocTitle(payload)}${art}`
             : `출처: ${payload.book_title} (p.${payload.page_start}~${payload.page_end})`;
-          const tail = truncated
-            ? `...\n(발췌 ${LIMIT}자 / 전체 ${full.length}자 — 전문은 get_rule_article로 조회)`
-            : "";
           return (
             `${rank + 1}위 (관련도: ${r.relevance_score.toFixed(3)})\n` +
             `${source}\n` +
-            `내용: ${snippet}${tail}`
+            `내용: ${body}${tail}`
           );
         });
 
@@ -262,6 +306,196 @@ const handler = createMcpHandler(
             {
               type: "text",
               text: `검색어: "${query}" (컬렉션: ${collection})\n\n${resultBlocks.join("\n\n")}`,
+            },
+          ],
+        };
+      }
+    );
+
+    server.registerTool(
+      "get_chunk_text",
+      {
+        title: "청크 전문 조회 (절단 없이)",
+        description:
+          "책·해설서 컬렉션에서 특정 청크의 본문 전체를 자르지 않고 반환합니다. " +
+          "search_book_library 결과가 '...'로 끝나 표·목록·질의회신이 중간에서 잘렸을 때, " +
+          "그 결과에 표시된 문서명과 시작 페이지(p.앞 숫자)를 그대로 넣어 호출하세요. " +
+          "page_start(정확 일치), page_from~page_to(범위), chunk_index 중 하나로 지정할 수 있고, " +
+          "아무 조건도 주지 않으면 해당 문서에 어떤 페이지 청크가 있는지 목록을 반환합니다. " +
+          "조문 단위로 저장된 사규 컬렉션(ponylink_rules)은 이 도구 대신 get_rule_article이 더 정확합니다.",
+        inputSchema: {
+          collection: z
+            .string()
+            .describe("컬렉션 이름 (예: krx_listing_disclosure, mna_playbook, valuation_playbook)"),
+          doc_title: z
+            .string()
+            .optional()
+            .describe(
+              "문서명 (부분일치, 공백 무시). 예: '코스닥시장 공시·상장관리 해설'. 생략하면 컬렉션 전체에서 찾습니다"
+            ),
+          page_start: z
+            .number()
+            .int()
+            .optional()
+            .describe("청크의 시작 페이지 (search_book_library 결과의 'p.353~355'에서 353)"),
+          page_from: z
+            .number()
+            .int()
+            .optional()
+            .describe("페이지 범위 시작 (page_start 대신 사용). 인접 청크까지 함께 볼 때"),
+          page_to: z.number().int().optional().describe("페이지 범위 끝"),
+          chunk_index: z
+            .number()
+            .int()
+            .optional()
+            .describe("청크 인덱스로 직접 지정 (payload의 chunk_index)"),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(20)
+            .default(5)
+            .describe("반환할 청크 최대 개수 (기본 5)"),
+        },
+      },
+      async ({ collection, doc_title, page_start, page_from, page_to, chunk_index, limit }) => {
+        const cap = limit ?? 5;
+        const all = await qdrantScroll(collection, null, 5000);
+
+        if (all.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `'${collection}' 컬렉션에서 포인트를 찾지 못했습니다. ` +
+                  `컬렉션 이름을 확인하거나 list_book_collections를 먼저 호출하세요.`,
+              },
+            ],
+          };
+        }
+
+        // 문서 필터 (부분일치)
+        let scoped = all;
+        if (doc_title) {
+          scoped = all.filter((p) => looseIncludes(payloadDocTitle(p.payload), doc_title));
+          if (scoped.length === 0) {
+            const docs = [...new Set(all.map((p) => payloadDocTitle(p.payload)))]
+              .filter(Boolean)
+              .sort();
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `'${doc_title}'과(와) 일치하는 문서를 찾지 못했습니다.\n\n` +
+                    `이 컬렉션의 문서 목록:\n- ${docs.join("\n- ")}`,
+                },
+              ],
+            };
+          }
+        }
+
+        const byPage = (p) => {
+          const s = p.payload?.page_start;
+          return typeof s === "number" ? s : Number.MAX_SAFE_INTEGER;
+        };
+        const byIndex = (p) => {
+          const i = p.payload?.chunk_index;
+          return typeof i === "number" ? i : 0;
+        };
+        scoped.sort((a, b) => byPage(a) - byPage(b) || byIndex(a) - byIndex(b));
+
+        // 위치 조건 적용
+        let picked = null;
+        if (chunk_index !== undefined && chunk_index !== null) {
+          picked = scoped.filter((p) => p.payload?.chunk_index === chunk_index);
+        } else if (page_start !== undefined && page_start !== null) {
+          picked = scoped.filter((p) => p.payload?.page_start === page_start);
+        } else if (
+          (page_from !== undefined && page_from !== null) ||
+          (page_to !== undefined && page_to !== null)
+        ) {
+          const lo = page_from ?? Number.MIN_SAFE_INTEGER;
+          const hi = page_to ?? Number.MAX_SAFE_INTEGER;
+          picked = scoped.filter((p) => {
+            const s = p.payload?.page_start;
+            return typeof s === "number" && s >= lo && s <= hi;
+          });
+        }
+
+        // 위치 조건이 전혀 없으면 목차 성격의 안내를 돌려준다
+        if (picked === null) {
+          const lines = scoped
+            .slice(0, 300)
+            .map(
+              (p) =>
+                `  p.${p.payload?.page_start}~${p.payload?.page_end}` +
+                ` (chunk_index ${p.payload?.chunk_index}, ${String(p.payload?.text || "").length}자` +
+                `${p.payload?.content_type ? `, ${p.payload.content_type}` : ""})`
+            );
+          const title = doc_title || "(문서 전체)";
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `■ ${collection} / ${title} — 청크 ${scoped.length}개\n` +
+                  `page_start·page_from~page_to·chunk_index 중 하나를 지정해 다시 호출하세요.\n\n` +
+                  `${lines.join("\n")}${scoped.length > 300 ? "\n  ... (이하 생략)" : ""}`,
+              },
+            ],
+          };
+        }
+
+        if (picked.length === 0) {
+          const pages = [...new Set(scoped.map((p) => p.payload?.page_start))]
+            .filter((v) => typeof v === "number")
+            .sort((a, b) => a - b);
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `지정한 조건에 해당하는 청크를 찾지 못했습니다.\n\n` +
+                  `이 문서에 존재하는 page_start 값: ${pages.join(", ")}\n\n` +
+                  `page_start는 청크의 '시작' 페이지입니다. 중간 페이지(예: p.354)로는 찾을 수 없으니, ` +
+                  `page_from~page_to 범위로 다시 시도하세요.`,
+              },
+            ],
+          };
+        }
+
+        let budget = MAX_TOTAL_CHARS;
+        const blocks = picked.slice(0, cap).map((p) => {
+          const pl = p.payload || {};
+          const full = String(pl.text || "");
+          const room = Math.max(0, budget);
+          const body = full.slice(0, room);
+          budget -= body.length;
+          const cut =
+            full.length > body.length
+              ? `\n(응답 총량 상한 ${MAX_TOTAL_CHARS}자에 걸려 ${body.length}/${full.length}자만 표시됨 — limit을 줄이거나 청크를 하나씩 조회하세요)`
+              : "";
+          const head =
+            `■ ${payloadDocTitle(pl)} p.${pl.page_start}~${pl.page_end}` +
+            ` (chunk_index ${pl.chunk_index}, 전체 ${full.length}자` +
+            `${pl.content_type ? `, ${pl.content_type}` : ""})`;
+          return `${head}\n\n${body}${cut}`;
+        });
+
+        const more =
+          picked.length > cap
+            ? `\n\n(조건에 맞는 청크 ${picked.length}개 중 ${cap}개만 표시 — limit을 늘리거나 조건을 좁히세요)`
+            : "";
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `청크 전문 조회 결과 ${Math.min(picked.length, cap)}건 (컬렉션: ${collection})\n\n${blocks.join(
+                "\n\n────────\n\n"
+              )}${more}`,
             },
           ],
         };
@@ -279,7 +513,7 @@ const handler = createMcpHandler(
           "article_no를 생략하면 해당 문서의 조문 목차(조 번호 + 표제 전체 목록)를 반환하므로, " +
           "'이 규정에 무슨 조문이 있나' '몇 조까지 있나'를 확인할 때도 사용합니다. " +
           "번호 표기는 '제56조', '56', '8조의2', '제8조의 2' 등 어떤 형태로 넣어도 정규화됩니다. " +
-          "조문 단위로 저장된 컬렉션(ponylink_rules)에서만 동작하며, 책 컬렉션에는 조문 메타데이터가 없습니다.",
+          "조문 단위로 저장된 컬렉션(ponylink_rules)에서만 동작하며, 책 컬렉션의 청크 전문은 get_chunk_text를 쓰세요.",
         inputSchema: {
           collection: z
             .string()
@@ -320,7 +554,8 @@ const handler = createMcpHandler(
                 text:
                   `'${coll}' 컬렉션에는 조문(article_no) 메타데이터가 없습니다. ` +
                   `이 도구는 조문 단위로 저장된 사규 컬렉션(ponylink_rules)에서만 동작합니다. ` +
-                  `대신 search_book_library로 의미검색을 사용하세요.`,
+                  `책·해설서 컬렉션에서 청크 전문이 필요하면 get_chunk_text를, ` +
+                  `키워드로 찾으려면 search_book_library를 사용하세요.`,
               },
             ],
           };
