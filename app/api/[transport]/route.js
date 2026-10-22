@@ -705,6 +705,41 @@ const GATE_KEYS = (process.env.MCP_GATE_KEYS || "")
   .filter(Boolean);
 const GATE_MODE = (process.env.MCP_GATE_MODE || "observe").trim().toLowerCase();
 
+// 범위 제한 키 — 다른 서버가 이 서버의 특정 컬렉션만 읽도록 따로 발급한 키.
+//   MCP_SCOPED_KEYS : "<키>@<컬렉션>+<컬렉션>" 을 쉼표로 구분(예: 거래소 규정 서버의 별표 조회용 키는
+//                     krx_listing_disclosure 만). 이 키로는 tools/call 의 get_chunk_text·search_book_library 를
+//                     허용된 컬렉션에 대해서만 부를 수 있고, 그 밖의 요청은 403으로 거절한다.
+//   MCP_GATE_KEYS 에는 넣지 않는다(넣으면 전체 권한이 된다).
+const SCOPED_TOOLS = new Set(["get_chunk_text", "search_book_library"]);
+const SCOPED_KEYS = new Map(
+  (process.env.MCP_SCOPED_KEYS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.includes("@"))
+    .map((s) => {
+      const i = s.lastIndexOf("@");
+      return [s.slice(0, i).trim(), new Set(s.slice(i + 1).split("+").map((c) => c.trim()).filter(Boolean))];
+    })
+);
+
+async function scopedAllowed(req, collections) {
+  if (req.method !== "POST") return false;
+  let body;
+  try {
+    body = JSON.parse(await req.clone().text());
+  } catch (e) {
+    return false;
+  }
+  const msgs = Array.isArray(body) ? body : [body];
+  if (!msgs.length) return false;
+  return msgs.every((m) => {
+    if (!m || m.method !== "tools/call") return false;
+    const p = m.params || {};
+    const coll = p.arguments && p.arguments.collection;
+    return SCOPED_TOOLS.has(p.name) && typeof coll === "string" && collections.has(coll);
+  });
+}
+
 function keyLabel(k) {
   if (!k) return "(none)";
   const m = String(k).match(/^plk_([A-Za-z0-9]+)_/);
@@ -718,6 +753,17 @@ function withGate(h) {
       k = new URL(req.url).searchParams.get("k");
     } catch (e) {
       k = null;
+    }
+    if (k && SCOPED_KEYS.has(k)) {
+      const ok = await scopedAllowed(req, SCOPED_KEYS.get(k));
+      console.log(`[gate] scoped caller=${keyLabel(k)} allowed=${ok}`);
+      if (!ok) {
+        return new Response(
+          JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32003, message: "이 키로는 허용된 컬렉션의 조회 도구만 부를 수 있습니다." } }),
+          { status: 403, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return h(req, ctx);
     }
     const allowed = GATE_KEYS.length === 0 || (!!k && GATE_KEYS.includes(k));
     console.log(
